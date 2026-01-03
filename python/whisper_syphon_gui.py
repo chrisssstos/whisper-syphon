@@ -68,18 +68,14 @@ class TextRenderer:
 
     def add_text(self, text: str):
         with self.lock:
-            # Preserve leading space for word separation, only strip trailing
-            has_leading_space = text.startswith(" ") or text.startswith("▁")
-            text = text.strip()
+            # Skip completely empty strings only
             if not text:
                 return
             # If we had faded, start fresh
             if self.faded:
                 self.current_text = ""
                 self.faded = False
-            # Add space before new word if needed
-            if has_leading_space and self.current_text:
-                self.current_text += " "
+            # Preserve original text with its spacing (spaces are word boundaries)
             self.current_text += text
             # Keep only last N words
             words = self.current_text.split()
