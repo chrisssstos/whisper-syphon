@@ -1,0 +1,8 @@
+moshi_mlx>=0.2.6
+cyndilib
+numpy
+Pillow
+sounddevice
+pyobjc-framework-ScreenCaptureKit
+pyobjc-framework-AVFoundation
+pyobjc-framework-CoreMedia

@@ -1,0 +1,45 @@
+# Virtual environments
+venv/
+.venv/
+python/.venv/
+
+# Build directories
+build/
+cpp/build/
+
+# External dependencies
+cpp/external/
+
+# Model files (typically large)
+cpp/models/
+*.bin
+*.ggml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+eggs/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Claude Code
+.claude/
+
+# External repos
+python/moshi-stt/
