@@ -47,7 +47,8 @@ class TextRenderer:
         self.lock = threading.Lock()
         self.last_update = time.time()
         self.fade_timeout = 1.0  # seconds before text fades
-        self.max_words = 4  # only show last N words
+        self.max_words = 3  # only show last N words
+        self.faded = False  # track if we've already faded
 
         self.font_large = None
         font_paths = [
@@ -70,6 +71,10 @@ class TextRenderer:
             text = text.strip()
             if not text:
                 return
+            # If we had faded, start fresh
+            if self.faded:
+                self.current_text = ""
+                self.faded = False
             self.current_text += text
             # Keep only last N words
             words = self.current_text.split()
@@ -95,13 +100,16 @@ class TextRenderer:
         with self.lock:
             elapsed = time.time() - self.last_update
             if elapsed > self.fade_timeout:
-                # Text has faded out
+                # Text has faded out - mark as faded and clear
+                self.faded = True
+                self.current_text = ""
                 return np.array(img)
 
             current = self.current_text.strip()
 
-            # Calculate fade alpha (fade out over 0.3 seconds after timeout)
-            if elapsed > self.fade_timeout - 0.3:
+            # Calculate fade alpha (fade out over 0.3 seconds before timeout)
+            fade_start = self.fade_timeout - 0.3
+            if elapsed > fade_start:
                 fade_progress = (self.fade_timeout - elapsed) / 0.3
                 alpha = int(255 * max(0, min(1, fade_progress)))
             else:
