@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Whisper Syphon GUI - Real-time lyrics/speech to NDI using Moshi STT
+Whisper Syphon GUI - Real-time lyrics/speech to NDI using Whisper
 """
 
 import sys
-import json
 import queue
 import threading
 import time
@@ -18,13 +17,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QColor, QPalette
 
-import mlx.core as mx
-import mlx.nn as nn
-import rustymimi
-import sentencepiece
 import sounddevice as sd
-from huggingface_hub import hf_hub_download
-from moshi_mlx import models, utils
+
+from whisper_resampler import AudioResampler
+from whisper_streaming_transcriber import WhisperStreamingTranscriber
 
 # ScreenCaptureKit for system audio (macOS 12.3+)
 try:
@@ -197,7 +193,7 @@ class SignalEmitter(QObject):
 class WhisperSyphonGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Whisper Syphon (Moshi + NDI)")
+        self.setWindowTitle("Whisper Syphon (Whisper + NDI)")
         self.setMinimumSize(700, 550)
         self.setStyleSheet("""
             QMainWindow { background-color: #1e1e1e; }
@@ -239,11 +235,8 @@ class WhisperSyphonGUI(QMainWindow):
         self.audio_stream = None
         self.screencapture_audio = None  # ScreenCaptureKit capture
         self.use_screencapture = False   # Flag for capture mode
-        self.model = None  # Store model for recreating generator
-        self.gen = None
-        self.text_tokenizer = None
-        self.audio_tokenizer = None
-        self.other_codebooks = None
+        self.transcriber = None  # WhisperStreamingTranscriber
+        self.resampler = None    # AudioResampler (24kHz -> 16kHz)
         self.renderer = None
         self.ndi = None
         self.block_queue = queue.Queue()
@@ -460,52 +453,21 @@ class WhisperSyphonGUI(QMainWindow):
 
         def load_thread():
             try:
-                hf_repo = "kyutai/stt-1b-en_fr-mlx"
+                # Initialize resampler (24kHz input -> 16kHz for Whisper)
+                self.resampler = AudioResampler(input_rate=24000, output_rate=16000)
 
-                lm_config_path = hf_hub_download(hf_repo, "config.json")
-                with open(lm_config_path, "r") as f:
-                    lm_config_dict = json.load(f)
-
-                mimi_weights = hf_hub_download(hf_repo, lm_config_dict["mimi_name"])
-                moshi_name = lm_config_dict.get("moshi_name", "model.safetensors")
-                moshi_weights = hf_hub_download(hf_repo, moshi_name)
-                tokenizer_path = hf_hub_download(hf_repo, lm_config_dict["tokenizer_name"])
-
-                lm_config = models.LmConfig.from_config_dict(lm_config_dict)
-                model = models.Lm(lm_config)
-                model.set_dtype(mx.bfloat16)
-
-                if moshi_weights.endswith(".q4.safetensors"):
-                    nn.quantize(model, bits=4, group_size=32)
-                elif moshi_weights.endswith(".q8.safetensors"):
-                    nn.quantize(model, bits=8, group_size=64)
-
-                model.load_weights(moshi_weights, strict=True)
-
-                self.text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
-
-                generated_codebooks = lm_config.generated_codebooks
-                self.other_codebooks = lm_config.other_codebooks
-                mimi_codebooks = max(generated_codebooks, self.other_codebooks)
-                self.audio_tokenizer = rustymimi.Tokenizer(mimi_weights, num_codebooks=mimi_codebooks)
-                # Store for recreating tokenizer on reset
-                self.mimi_weights = mimi_weights
-                self.mimi_codebooks = mimi_codebooks
-
-                model.warmup()
-
-                # Store model reference for recreating generator
-                self.model = model
-
-                # More sensitive settings for music/lyrics
-                self.gen = models.LmGen(
-                    model=model,
-                    max_steps=8192,
-                    text_sampler=utils.Sampler(top_k=50, temp=0.3),  # Higher temp for lyrics
-                    audio_sampler=utils.Sampler(top_k=250, temp=0.8),
-                    check=False,
+                # Initialize Whisper streaming transcriber
+                self.transcriber = WhisperStreamingTranscriber(
+                    model_name="large-v3-turbo",
+                    sample_rate=16000,
+                    min_chunk_seconds=0.5,      # Balanced latency/accuracy
+                    max_buffer_seconds=30.0,
+                    vad_threshold=0.35,         # Tuned for vocals in music
+                    silence_threshold=0.01,
                 )
+                self.transcriber.load_model()
 
+                # Initialize renderer and NDI (unchanged)
                 self.renderer = TextRenderer(1920, 1080)
                 self.ndi = NDIOutput("Whisper Lyrics", 1920, 1080, 30)
 
@@ -513,6 +475,8 @@ class WhisperSyphonGUI(QMainWindow):
                 self.signals.status_signal.emit("model", "ready")
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 self.signals.status_signal.emit("model", f"error:{e}")
 
         threading.Thread(target=load_thread, daemon=True).start()
@@ -651,10 +615,8 @@ class WhisperSyphonGUI(QMainWindow):
                 time.sleep(frame_time - elapsed)
 
     def transcribe_loop(self):
-        import sys
-        step_count = 0
-        max_steps = 7500  # Reset well before hitting 8192 limit
-        blocks_processed = 0
+        """Main transcription loop using Whisper streaming"""
+        chunks_processed = 0
         last_debug_time = time.time()
 
         while self.running:
@@ -662,57 +624,59 @@ class WhisperSyphonGUI(QMainWindow):
                 # Check if watchdog requested a reset
                 if self.needs_reset:
                     print("[TRANSCRIBE] Watchdog requested reset", flush=True)
-                    self._reset_generator()
-                    step_count = 0
+                    self._reset_transcriber()
                     self.needs_reset = False
                     continue
 
-                block = self.block_queue.get(timeout=0.1)
-                block = block[None, :, 0]
+                # Get audio block from queue
+                try:
+                    block = self.block_queue.get(timeout=0.1)
+                except queue.Empty:
+                    # Still process any buffered audio
+                    if self.transcriber:
+                        text = self.transcriber.process_step()
+                        if text:
+                            print(f"[TEXT] '{text}'", flush=True)
+                            self.signals.text_signal.emit(text)
+                    continue
 
-                other_audio_tokens = self.audio_tokenizer.encode_step(block[None, 0:1])
-                other_audio_tokens = mx.array(other_audio_tokens).transpose(0, 2, 1)[
-                    :, :, :self.other_codebooks
-                ]
+                # Flatten to 1D if needed
+                audio = block.flatten() if block.ndim > 1 else block
 
-                text_token = self.gen.step(other_audio_tokens[0])
-                text_token = text_token[0].item()
-                step_count += 1
-                blocks_processed += 1
-                self.last_transcribe_time = time.time()  # Heartbeat for watchdog
+                # Resample 24kHz -> 16kHz for Whisper
+                resampled = self.resampler.resample(audio)
+                if len(resampled) == 0:
+                    continue
 
-                # Debug output every 5 seconds and update UI
-                if time.time() - last_debug_time > 5.0:
-                    audio_level = np.abs(block).mean()
-                    print(f"[DEBUG] Blocks: {blocks_processed}, Steps: {step_count}, Q: {self.block_queue.qsize()}, Level: {audio_level:.4f}, Shape: {block.shape}, Token: {text_token}", flush=True)
-                    self.signals.step_signal.emit(step_count)
-                    last_debug_time = time.time()
+                # Feed to transcriber buffer
+                self.transcriber.insert_audio(resampled)
 
-                # Token 0 = silence, Token 3 = end/pad
-                if text_token not in (0, 3):
-                    text = self.text_tokenizer.id_to_piece(text_token)
-                    text = text.replace("▁", " ")
+                # Process and get any new text
+                text = self.transcriber.process_step()
+                if text:
                     print(f"[TEXT] '{text}'", flush=True)
                     self.signals.text_signal.emit(text)
 
-                # Recreate generator before hitting limit
-                if step_count >= max_steps:
-                    print(f"[DEBUG] Reached {step_count} steps, resetting...")
-                    self._reset_generator()
-                    step_count = 0
+                chunks_processed += 1
+                self.last_transcribe_time = time.time()
 
-            except queue.Empty:
-                continue
+                # Debug output every 5 seconds
+                if time.time() - last_debug_time > 5.0:
+                    audio_level = np.abs(audio).mean()
+                    buffer_dur = self.transcriber.get_buffer_duration()
+                    print(f"[DEBUG] Chunks: {chunks_processed}, Q: {self.block_queue.qsize()}, "
+                          f"Level: {audio_level:.4f}, Buffer: {buffer_dur:.1f}s", flush=True)
+                    self.signals.step_signal.emit(chunks_processed)
+                    last_debug_time = time.time()
+
             except Exception as e:
-                # On error, try to reset and continue
-                print(f"[Transcribe] Error: {e}, resetting...")
+                print(f"[Transcribe] Error: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
-                self._reset_generator()
-                step_count = 0
+                self._reset_transcriber()
 
-    def _reset_generator(self):
-        """Reset the generator and audio tokenizer, clearing stale audio"""
+    def _reset_transcriber(self):
+        """Reset the transcriber and resampler, clearing stale audio"""
         print("[RESET] Starting reset...", flush=True)
 
         # Clear the queue to prevent stale audio
@@ -725,19 +689,12 @@ class WhisperSyphonGUI(QMainWindow):
                 break
         print(f"[RESET] Cleared {cleared} blocks from queue", flush=True)
 
-        # Recreate generator with fresh state (same sensitive settings)
-        print("[RESET] Creating new LmGen...", flush=True)
-        self.gen = models.LmGen(
-            model=self.model,
-            max_steps=8192,
-            text_sampler=utils.Sampler(top_k=50, temp=0.3),  # Higher temp for lyrics
-            audio_sampler=utils.Sampler(top_k=250, temp=0.8),
-            check=False,
-        )
+        # Reset transcriber and resampler state
+        if self.transcriber:
+            self.transcriber.reset()
+        if self.resampler:
+            self.resampler.reset()
 
-        # Recreate audio tokenizer (reset() doesn't clear internal step counter)
-        print(f"[RESET] Creating new Tokenizer from {self.mimi_weights}...", flush=True)
-        self.audio_tokenizer = rustymimi.Tokenizer(self.mimi_weights, num_codebooks=self.mimi_codebooks)
         print("[RESET] Complete!", flush=True)
 
     def on_text(self, text):
@@ -818,7 +775,7 @@ class WhisperSyphonGUI(QMainWindow):
             self.step_status.setText("Steps: STALLED")
             self.step_status.setStyleSheet("color: red;")
 
-            # Signal transcribe loop to reset (don't call _reset_generator directly - threading issue)
+            # Signal transcribe loop to reset (don't call _reset_transcriber directly - threading issue)
             self.needs_reset = True
             self.last_transcribe_time = now
 
